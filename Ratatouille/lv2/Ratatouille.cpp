@@ -327,36 +327,47 @@ inline const LV2_Atom* Xratatouille::read_set_file(const LV2_Atom_Object* obj) {
 inline void Xratatouille::check_messages(uint32_t n_samples)
 {
     if(n_samples<1) return;
-    const uint32_t notify_capacity = this->notify->atom.size;
-    lv2_atom_forge_set_buffer(&forge, (uint8_t*)notify, notify_capacity);
-    lv2_atom_forge_sequence_head(&forge, &notify_frame, 0);
+    // avoid unnecessary writes to engine.bufsize if unchanged
+    if (engine.bufsize != (int)n_samples) engine.bufsize = n_samples;
 
-    engine.bufsize = n_samples;
-
-    LV2_ATOM_SEQUENCE_FOREACH(control, ev) {
-        if (lv2_atom_forge_is_object_type(&forge, ev->body.type)) {
-            const LV2_Atom_Object* obj = (LV2_Atom_Object*)&ev->body;
-            if (obj->body.otype == patch_Get) {
-                if (engine.model_file != "None")
-                    write_set_file(&forge, xlv2_model_file, engine.model_file.data());
-                if (engine.model_file1 != "None")
-                    write_set_file(&forge, xlv2_model_file1, engine.model_file1.data());
-                if (engine.ir_file != "None")
-                    write_set_file(&forge, xlv2_ir_file, engine.ir_file.data());
-                if (engine.ir_file1 != "None")
-                    write_set_file(&forge, xlv2_ir_file1, engine.ir_file1.data());
-           } else if (obj->body.otype == patch_Set) {
-                const LV2_Atom* file_path = read_set_file(obj);
-                if (file_path) {
-                    if (engine._ab.load(std::memory_order_acquire) == 1)
-                        engine.model_file = (const char*)(file_path+1);
-                    else if (engine._ab.load(std::memory_order_acquire) == 2)
-                        engine.model_file1 = (const char*)(file_path+1);
-                    else if (engine._cd.load(std::memory_order_acquire) == 1)
-                        engine.ir_file = (const char*)(file_path+1);
-                    else if (engine._cd.load(std::memory_order_acquire) == 2)
-                        engine.ir_file1 = (const char*)(file_path+1);
-                    if (!doit) doit = true;
+    // Prepare LV2 atom forge buffer lazily only when we need to write to `notify`.
+    bool forge_prepared = false;
+    if (control) {
+        LV2_ATOM_SEQUENCE_FOREACH(control, ev) {
+            if (lv2_atom_forge_is_object_type(&forge, ev->body.type)) {
+                const LV2_Atom_Object* obj = (LV2_Atom_Object*)&ev->body;
+                if (obj->body.otype == patch_Get) {
+                    if (!forge_prepared && notify) {
+                        const uint32_t notify_capacity = this->notify->atom.size;
+                        lv2_atom_forge_set_buffer(&forge, (uint8_t*)notify, notify_capacity);
+                        lv2_atom_forge_sequence_head(&forge, &notify_frame, 0);
+                        forge_prepared = true;
+                    }
+                    if (forge_prepared) {
+                        if (engine.model_file != "None")
+                            write_set_file(&forge, xlv2_model_file, engine.model_file.data());
+                        if (engine.model_file1 != "None")
+                            write_set_file(&forge, xlv2_model_file1, engine.model_file1.data());
+                        if (engine.ir_file != "None")
+                            write_set_file(&forge, xlv2_ir_file, engine.ir_file.data());
+                        if (engine.ir_file1 != "None")
+                            write_set_file(&forge, xlv2_ir_file1, engine.ir_file1.data());
+                    }
+               } else if (obj->body.otype == patch_Set) {
+                    const LV2_Atom* file_path = read_set_file(obj);
+                    if (file_path) {
+                        const uint32_t ab_state = engine._ab.load(std::memory_order_acquire);
+                        const uint32_t cd_state = engine._cd.load(std::memory_order_acquire);
+                        if (ab_state == 1)
+                            engine.model_file = (const char*)(file_path+1);
+                        else if (ab_state == 2)
+                            engine.model_file1 = (const char*)(file_path+1);
+                        else if (cd_state == 1)
+                            engine.ir_file = (const char*)(file_path+1);
+                        else if (cd_state == 2)
+                            engine.ir_file1 = (const char*)(file_path+1);
+                        if (!doit) doit = true;
+                    }
                 }
             }
         }
@@ -372,7 +383,8 @@ inline void Xratatouille::check_messages(uint32_t n_samples)
     engine.blend = *_blend;
     engine.mix = *_mix;
     engine.delay = *_delay;
-    engine.cdelay->delay = engine.delay;
+    // only update cdelay when delay actually changed to avoid unnecessary writes
+    if (engine.cdelay && engine.cdelay->delay != engine.delay) engine.cdelay->delay = engine.delay;
     engine.phasecor_ = *_phasecor;
     engine.buffered = *_buffered;
 

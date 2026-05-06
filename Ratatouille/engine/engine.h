@@ -160,6 +160,10 @@ private:
 
     float*                       bufferoutput0;
     float*                       bufferinput0;
+    // temporary per-block buffers to avoid VLAs on the stack
+    float*                       tmp_bufa;
+    float*                       tmp_bufb;
+    uint32_t                     tmp_bufsize;
     float*                       _bufb;
 
     double                       fRec0[2];
@@ -167,6 +171,18 @@ private:
     double                       fRec2[2];
     double                       fRec1[2];
     double                       fRec4[2];
+
+    // cached slow parameter values to avoid recomputing pow() every block
+    double                       last_inputGain_val;
+    double                       last_inputGain1_val;
+    double                       last_outputGain_val;
+    double                       last_blend_val;
+    double                       last_mix_val;
+    double                       cached_fSlow0;
+    double                       cached_fSlow4;
+    double                       cached_fSlow3;
+    double                       cached_fSlow2;
+    double                       cached_fSlow1;
 
     inline void processSlotB();
     inline void processConv1();
@@ -192,7 +208,20 @@ inline Engine::Engine() :
     conv1(),
     bufferoutput0(NULL),
     bufferinput0(NULL),
-    _bufb(0) {
+    _bufb(0),
+    tmp_bufa(NULL),
+    tmp_bufb(NULL),
+    tmp_bufsize(0),
+    last_inputGain_val(1e99),
+    last_inputGain1_val(1e99),
+    last_outputGain_val(1e99),
+    last_blend_val(1e99),
+    last_mix_val(1e99),
+    cached_fSlow0(0.0),
+    cached_fSlow4(0.0),
+    cached_fSlow3(0.0),
+    cached_fSlow2(0.0),
+    cached_fSlow1(0.0) {
         bufsize = 0;
         buffersize = 0;
         phaseOffset = 0;
@@ -231,6 +260,8 @@ inline Engine::~Engine(){
 
     delete[] bufferoutput0;
     delete[] bufferinput0;
+    delete[] tmp_bufa;
+    delete[] tmp_bufb;
 
     dcb->del_instance(dcb);
     cdelay->del_instance(cdelay);
@@ -409,18 +440,48 @@ inline void Engine::processDsp(uint32_t n_samples, float* output)
     }
     MXCSR.set_();
 
-    // get controller values from host
-    double fSlow0 = 0.0010000000000000009 * std::pow(1e+01, 0.05 * double(inputGain));
-    double fSlow4 = 0.0010000000000000009 * std::pow(1e+01, 0.05 * double(inputGain1));
-    double fSlow3 = 0.0010000000000000009 * std::pow(1e+01, 0.05 * double(outputGain));
-    double fSlow2 = 0.0010000000000000009 * double(blend);
-    double fSlow1 = 0.0010000000000000009 * double(mix);
+    // Cache atomic flags and thread availability to avoid repeated atomic loads
+    const bool neuralA = _neuralA.load(std::memory_order_acquire);
+    const bool neuralB = _neuralB.load(std::memory_order_acquire);
+    const bool execute = _execute.load(std::memory_order_acquire);
+    const bool proAvailable = pro.getProcess();
 
-    // internal buffer
-    float bufa[n_samples];
+    // compute per-block parameters but cache the expensive pow() results
+    if ((double)inputGain != last_inputGain_val) {
+        last_inputGain_val = (double)inputGain;
+        cached_fSlow0 = 0.0010000000000000009 * std::pow(1e+01, 0.05 * last_inputGain_val);
+    }
+    if ((double)inputGain1 != last_inputGain1_val) {
+        last_inputGain1_val = (double)inputGain1;
+        cached_fSlow4 = 0.0010000000000000009 * std::pow(1e+01, 0.05 * last_inputGain1_val);
+    }
+    if ((double)outputGain != last_outputGain_val) {
+        last_outputGain_val = (double)outputGain;
+        cached_fSlow3 = 0.0010000000000000009 * std::pow(1e+01, 0.05 * last_outputGain_val);
+    }
+    if ((double)blend != last_blend_val) {
+        last_blend_val = (double)blend;
+        cached_fSlow2 = 0.0010000000000000009 * double(last_blend_val);
+    }
+    if ((double)mix != last_mix_val) {
+        last_mix_val = (double)mix;
+        cached_fSlow1 = 0.0010000000000000009 * double(last_mix_val);
+    }
+
+    // ensure tmp buffers are allocated and large enough
+    if (tmp_bufsize < n_samples) {
+        delete[] tmp_bufa;
+        delete[] tmp_bufb;
+        tmp_bufa = new float[n_samples];
+        tmp_bufb = new float[n_samples];
+        tmp_bufsize = n_samples;
+    }
+
+    // internal buffer: copy once from output then duplicate locally to avoid two host reads
+    float* bufa = tmp_bufa;
+    float* bufb = tmp_bufb;
     memcpy(bufa, output, n_samples*sizeof(float));
-    float bufb[n_samples];
-    memcpy(bufb, output, n_samples*sizeof(float));
+    memcpy(bufb, bufa, n_samples*sizeof(float));
     bufsize = n_samples;
 
     // process delta delay
@@ -439,18 +500,18 @@ inline void Engine::processDsp(uint32_t n_samples, float* output)
     }
 
     // process input volume slot A
-    if (_neuralA.load(std::memory_order_acquire)) {
+    if (neuralA) {
         for (uint32_t i0 = 0; i0 < n_samples; i0 = i0 + 1) {
-            fRec0[0] = fSlow0 + 0.999 * fRec0[1];
+            fRec0[0] = cached_fSlow0 + 0.999 * fRec0[1];
             bufa[i0] = float(double(bufa[i0]) * fRec0[0]);
             fRec0[1] = fRec0[0];
         }
     }
 
     // process input volume slot B
-    if (_neuralB.load(std::memory_order_acquire)) {
+    if (neuralB) {
         for (uint32_t i0 = 0; i0 < n_samples; i0 = i0 + 1) {
-            fRec4[0] = fSlow4 + 0.999 * fRec4[1];
+            fRec4[0] = cached_fSlow4 + 0.999 * fRec4[1];
             bufb[i0] = float(double(bufb[i0]) * fRec4[0]);
             fRec4[1] = fRec4[0];
         }
@@ -458,8 +519,8 @@ inline void Engine::processDsp(uint32_t n_samples, float* output)
 
     // process slot B in parallel thread
     _bufb = bufb;
-    if (_neuralB.load(std::memory_order_acquire) ) {
-        if ( pro.getProcess()) {
+    if (neuralB) {
+        if (proAvailable) {
             pro.setProcessor(0);
             pro.runProcess();
         } else {
@@ -477,13 +538,13 @@ inline void Engine::processDsp(uint32_t n_samples, float* output)
     }
 
     // process slot A
-    if (_neuralA.load(std::memory_order_acquire)) {
+    if (neuralA) {
         slotA.compute(n_samples, bufa, bufa);
         if (normSlotA) slotA.normalize(n_samples, bufa);
     }
 
     //wait for parallel processed slot B when needed
-    if (_neuralB.load(std::memory_order_acquire)) {
+    if (neuralB) {
         if (!pro.processWait()) {
             XrunCounter += 1;
             _notify_ui.store(true, std::memory_order_release);
@@ -498,22 +559,22 @@ inline void Engine::processDsp(uint32_t n_samples, float* output)
     }
 
     // mix output when needed
-    if (_neuralA.load(std::memory_order_acquire) && _neuralB.load(std::memory_order_acquire)) {
+    if (neuralA && neuralB) {
         for (uint32_t i0 = 0; i0 < n_samples; i0 = i0 + 1) {
-            fRec2[0] = fSlow2 + 0.999 * fRec2[1];
+            fRec2[0] = cached_fSlow2 + 0.999 * fRec2[1];
             output[i0] = bufa[i0] * (1.0 - fRec2[0]) + bufb[i0] * fRec2[0];
             fRec2[1] = fRec2[0];
         }
-    } else if (_neuralA.load(std::memory_order_acquire)) {
+    } else if (neuralA) {
         memcpy(output, bufa, n_samples*sizeof(float));
-    } else if (_neuralB.load(std::memory_order_acquire)) {
+    } else if (neuralB) {
         memcpy(output, bufb, n_samples*sizeof(float));
     }
 
-    if (_neuralA.load(std::memory_order_acquire) || _neuralB.load(std::memory_order_acquire)) {
+    if (neuralA || neuralB) {
         // output volume
         for (uint32_t i0 = 0; i0 < n_samples; i0 = i0 + 1) {
-            fRec3[0] = fSlow3 + 0.999 * fRec3[1];
+            fRec3[0] = cached_fSlow3 + 0.999 * fRec3[1];
             output[i0] = float(double(output[i0]) * fRec3[0]);
             fRec3[1] = fRec3[0];
         }
@@ -522,14 +583,14 @@ inline void Engine::processDsp(uint32_t n_samples, float* output)
     // run dcblocker
     dcb->compute(n_samples, output, output);
 
-    // set buffer for mix control
+    // set buffer for mix control: copy once then duplicate locally
     memcpy(bufa, output, n_samples*sizeof(float));
-    memcpy(bufb, output, n_samples*sizeof(float));
+    memcpy(bufb, bufa, n_samples*sizeof(float));
 
     // process conv1 in parallel thread
     _bufb = bufb;
-    if (!_execute.load(std::memory_order_acquire) && conv1.is_runnable()) {
-        if (pro.getProcess()) {
+    if (!execute && conv1.is_runnable()) {
+        if (proAvailable) {
             pro.setProcessor(1);
             pro.runProcess();
         } else {
@@ -547,11 +608,11 @@ inline void Engine::processDsp(uint32_t n_samples, float* output)
     }
 
     // process conv
-    if (!_execute.load(std::memory_order_acquire) && conv.is_runnable())
+    if (!execute && conv.is_runnable())
         conv.compute(n_samples, bufa, bufa);
 
     // wait for parallel processed conv1 when needed
-    if (!_execute.load(std::memory_order_acquire) && conv1.is_runnable()) {
+    if (!execute && conv1.is_runnable()) {
         if (!pro.processWait()) {
             XrunCounter += 1;
             _notify_ui.store(true, std::memory_order_release);
@@ -565,17 +626,16 @@ inline void Engine::processDsp(uint32_t n_samples, float* output)
         }
     }
 
-    // mix output when needed
-    if ((!_execute.load(std::memory_order_acquire) &&
-            conv.is_runnable()) && conv1.is_runnable()) {
+    // mix output when needed (use cached 'execute' and cached_fSlow1)
+    if ((!execute && conv.is_runnable()) && conv1.is_runnable()) {
         for (uint32_t i0 = 0; i0 < n_samples; i0 = i0 + 1) {
-            fRec1[0] = fSlow1 + 0.999 * fRec1[1];
+            fRec1[0] = cached_fSlow1 + 0.999 * fRec1[1];
             output[i0] = bufa[i0] * (1.0 - fRec1[0]) + bufb[i0] * fRec1[0];
             fRec1[1] = fRec1[0];
         }
-    } else if (!_execute.load(std::memory_order_acquire) && conv.is_runnable()) {
+    } else if (!execute && conv.is_runnable()) {
         memcpy(output, bufa, n_samples*sizeof(float));
-    } else if (!_execute.load(std::memory_order_acquire) && conv1.is_runnable()) {
+    } else if (!execute && conv1.is_runnable()) {
         memcpy(output, bufb, n_samples*sizeof(float));
     }
     // notify neural modeller that process cycle is done
